@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-bili2doc - B站视频AI转文字工具
-================================
+bili2doc - B站视频AI转文字工具 (夜间无人值守版)
+================================================
 使用360AI浏览器的全文AI分析功能，将B站视频内容自动转录为.docx文档。
+
+夜间运行特性：
+- 处理完每个视频后自动最小化浏览器窗口
+- 需要操作时自动恢复窗口到前台
+- 完成后自动生成状态报告
+- 无GUI交互，全日志驱动
+- 支持定时启动和后台运行
 
 核心技术：
 - 360AI浏览器扩展的「全文」AI分析功能
@@ -51,6 +58,7 @@ class Config:
     SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
     VIDEO_LIST_FILE = PROJECT_ROOT / "video_list.json"
     STATE_FILE = PROJECT_ROOT / "batch_state.json"
+    REPORT_FILE = PROJECT_ROOT / "night_run_report.json"
     
     # === 流程参数 ===
     WAIT_AI_SECONDS = 120          # AI分析等待时间
@@ -75,11 +83,16 @@ class Config:
     DOWNLOAD_MONITOR_SECONDS = 90  # 下载监控时间
     MIN_FILE_SIZE = 1000           # 最小文件大小
     
+    # === 夜间运行配置 ===
+    NIGHT_MODE = True              # 夜间模式：自动最小化浏览器
+    BROWSER_MINIMIZE_AFTER_VIDEO = True  # 处理完每个视频后最小化
+    
     @classmethod
     def ensure_dirs(cls):
         """确保所有目录存在"""
         cls.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         Path(cls.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+        (cls.PROJECT_ROOT / "logs").mkdir(exist_ok=True)
 
 
 # ==================== 日志配置 ====================
@@ -170,6 +183,52 @@ class BrowserManager:
             return True
         
         win32gui.EnumWindows(enum_callback, None)
+    
+    @classmethod
+    def minimize_browser(cls) -> bool:
+        """最小化浏览器窗口（夜间模式用）"""
+        info = cls.find_browser()
+        if not info:
+            return False
+        
+        hwnd = info[0]
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            return True
+        except Exception:
+            return False
+    
+    @classmethod
+    def restore_browser(cls) -> bool:
+        """恢复浏览器窗口到前台"""
+        info = cls.find_browser()
+        if not info:
+            return False
+        
+        hwnd = info[0]
+        try:
+            # 恢复窗口
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.2)
+            win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+            time.sleep(0.3)
+            
+            # 置顶
+            win32gui.BringWindowToTop(hwnd)
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+            
+            # 点击中心确保焦点
+            rect = win32gui.GetWindowRect(hwnd)
+            cx = (rect[0] + rect[2]) // 2
+            cy = (rect[1] + rect[3]) // 2
+            pyautogui.click(cx, cy)
+            time.sleep(0.5)
+            
+            return True
+        except Exception:
+            return False
     
     @classmethod
     def force_foreground(cls) -> bool:
@@ -387,7 +446,12 @@ class VideoProcessor:
         self.logger.info(f"处理: {tag} {title} (第{attempt+1}次)")
         
         try:
-            # 1. 确保浏览器可用
+            # 1. 确保浏览器可用（恢复窗口）
+            if Config.NIGHT_MODE:
+                BrowserManager.restore_browser()
+            else:
+                BrowserManager.force_foreground()
+            
             if not BrowserManager.ensure_ready():
                 return {"success": False, "rate_limited": False}
             
@@ -395,10 +459,16 @@ class VideoProcessor:
             nav_ok = False
             for nav_try in range(Config.NAVIGATE_MAX_RETRY):
                 self.logger.debug(f"导航尝试 {nav_try+1}/{Config.NAVIGATE_MAX_RETRY}")
-                BrowserManager.force_foreground()
+                if Config.NIGHT_MODE:
+                    BrowserManager.restore_browser()
+                else:
+                    BrowserManager.force_foreground()
                 Navigator.navigate_to(url)
                 time.sleep(Config.NAVIGATE_WAIT)
-                BrowserManager.force_foreground()
+                if Config.NIGHT_MODE:
+                    BrowserManager.restore_browser()
+                else:
+                    BrowserManager.force_foreground()
                 time.sleep(2)
                 
                 if Navigator.verify_navigation():
@@ -419,12 +489,18 @@ class VideoProcessor:
             self.logger.info("★ 点击「全文」...")
             self._click_coord("全文")
             
-            # 5. 等待AI分析
+            # 5. 等待AI分析（夜间模式可最小化）
             self.logger.info(f"等待AI分析({Config.WAIT_AI_SECONDS}s)...")
-            self._wait_with_progress(Config.WAIT_AI_SECONDS)
             
-            BrowserManager.force_foreground()
-            time.sleep(2)
+            if Config.NIGHT_MODE:
+                BrowserManager.minimize_browser()
+                self.logger.info("浏览器已最小化，AI分析中不打扰...")
+                time.sleep(Config.WAIT_AI_SECONDS)
+                BrowserManager.restore_browser()
+            else:
+                self._wait_with_progress(Config.WAIT_AI_SECONDS)
+                if Config.NIGHT_MODE:
+                    BrowserManager.restore_browser()
             
             # 6. AI结果检测
             screenshot_path = self._screenshot(f"{bvid}_pre_exp")
@@ -432,6 +508,8 @@ class VideoProcessor:
             
             if ai_status == 'error':
                 self.logger.info("❌ AI失败(频率限制)，跳过导出")
+                if Config.NIGHT_MODE:
+                    BrowserManager.minimize_browser()
                 return {"success": False, "rate_limited": True}
             
             # 7. 记录导出前文件
@@ -444,8 +522,8 @@ class VideoProcessor:
             # 9. 下载确认
             self.logger.info("回车确认下载...")
             time.sleep(2)
-            BrowserManager.force_foreground()
-            time.sleep(0.5)
+            if Config.NIGHT_MODE:
+                BrowserManager.restore_browser()
             pyautogui.press('enter')
             time.sleep(5)
             
@@ -453,11 +531,14 @@ class VideoProcessor:
             dl = DownloadMonitor.check_new_download(bvid, before_files)
             if dl:
                 self.logger.info(f"✅ 下载成功: {dl['filename']} ({dl['size']} bytes)")
+                if Config.NIGHT_MODE:
+                    BrowserManager.minimize_browser()
                 return {"success": True, "download": dl, "rate_limited": False}
             
             # 11. 备用方案
             self.logger.info("备用下载确认...")
-            BrowserManager.force_foreground()
+            if Config.NIGHT_MODE:
+                BrowserManager.restore_browser()
             pyautogui.click(960, 520)
             time.sleep(1)
             pyautogui.press('enter')
@@ -466,6 +547,8 @@ class VideoProcessor:
             dl = DownloadMonitor.check_new_download(bvid, before_files)
             if dl:
                 self.logger.info(f"✅ 备用下载成功")
+                if Config.NIGHT_MODE:
+                    BrowserManager.minimize_browser()
                 return {"success": True, "download": dl, "rate_limited": False}
             
             # 12. 长时间监控
@@ -477,32 +560,40 @@ class VideoProcessor:
                     break
                 # 定期确认
                 if (i+1) % 6 == 0 and i < 15:
-                    BrowserManager.force_foreground()
+                    if Config.NIGHT_MODE:
+                        BrowserManager.restore_browser()
                     pyautogui.press('enter')
                     time.sleep(2)
             
             if dl:
                 self.logger.info(f"✅ 延迟下载成功: {dl['filename']}")
+                if Config.NIGHT_MODE:
+                    BrowserManager.minimize_browser()
                 return {"success": True, "download": dl, "rate_limited": False}
             
             self.logger.error("❌ 下载超时")
             self._screenshot(f"{bvid}_timeout")
+            if Config.NIGHT_MODE:
+                BrowserManager.minimize_browser()
             return {"success": False, "rate_limited": False}
             
         except Exception as e:
             self.logger.error(f"❌ 异常: {type(e).__name__}: {str(e)[:60]}")
+            if Config.NIGHT_MODE:
+                BrowserManager.minimize_browser()
             return {"success": False, "rate_limited": False}
     
     def _click_coord(self, name: str):
         """点击指定坐标"""
-        BrowserManager.force_foreground()
+        if Config.NIGHT_MODE:
+            BrowserManager.restore_browser()
         time.sleep(1)
         pyautogui.click(*Config.COORDS[name])
         time.sleep(2)
     
     def _screenshot(self, name: str) -> str:
         """截图"""
-        path = str(Config.SCREENSHOT_DIR / f"v48_{name}.png")
+        path = str(Config.SCREENSHOT_DIR / f"v49_{name}.png")
         try:
             pyautogui.screenshot(path)
         except Exception:
@@ -515,6 +606,36 @@ class VideoProcessor:
             time.sleep(15)
             if (i+1) % 2 == 0:
                 self.logger.debug(f"  {(i+1)*15}s...")
+
+
+# ==================== 报告生成 ====================
+class ReportGenerator:
+    """运行报告生成"""
+    
+    @staticmethod
+    def generate_report(stats: Dict, state: Dict, start_time: float, total_videos: int) -> Dict:
+        """生成运行报告"""
+        elapsed = (time.time() - start_time) / 60
+        
+        report = {
+            "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_videos": total_videos,
+            "processed": stats["success"] + stats["failed"],
+            "success": stats["success"],
+            "failed": stats["failed"],
+            "attempts": stats["attempts"],
+            "elapsed_minutes": round(elapsed, 1),
+            "state": {
+                "completed": state.get("completed", []),
+                "failed": state.get("failed", [])
+            }
+        }
+        
+        # 保存报告
+        with open(Config.REPORT_FILE, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        
+        return report
 
 
 # ==================== 批量处理 ====================
@@ -547,9 +668,10 @@ class BatchProcessor:
         videos = self.load_video_list()
         total = len(videos)
         self.logger.info(f"=" * 60)
-        self.logger.info(f"bili2doc 批量处理 v48 (生产版)")
+        self.logger.info(f"bili2doc 批量处理 v49 (夜间无人值守版)")
         self.logger.info(f"=" * 60)
         self.logger.info(f"总视频数: {total}")
+        self.logger.info(f"夜间模式: {'开启' if Config.NIGHT_MODE else '关闭'}")
         
         # 加载状态
         state = self.load_state()
@@ -577,6 +699,12 @@ class BatchProcessor:
         # 启动浏览器
         self.logger.info("\n启动浏览器...")
         BrowserManager.restart("启动前重启")
+        
+        # 夜间模式：初始最小化
+        if Config.NIGHT_MODE:
+            time.sleep(2)
+            BrowserManager.minimize_browser()
+            self.logger.info("浏览器已最小化，夜间模式运行中...")
         
         # 统计
         stats = {"success": 0, "failed": 0, "attempts": 0}
@@ -655,6 +783,9 @@ class BatchProcessor:
                 est = remaining * (elapsed / max(stats["success"] + stats["failed"], 1))
                 self.logger.info(f"  剩余{remaining}个 ≈ {est:.0f}分({est/60:.1f}h)")
         
+        # 生成报告
+        report = ReportGenerator.generate_report(stats, state, start_time, total)
+        
         # 最终报告
         total_time = (time.time() - start_time) / 60
         self.logger.info(f"\n{'='*60}")
@@ -664,6 +795,12 @@ class BatchProcessor:
         self.logger.info(f"  失败: {stats['failed']}")
         self.logger.info(f"  总尝试: {stats['attempts']}")
         self.logger.info(f"  总耗时: {total_time:.0f}分({total_time/60:.1f}h)")
+        self.logger.info(f"  报告已保存: {Config.REPORT_FILE}")
+        
+        # 夜间模式：最后最小化浏览器
+        if Config.NIGHT_MODE:
+            BrowserManager.minimize_browser()
+            self.logger.info("浏览器已最小化，任务完成！")
     
     def _get_cooldown(self, retry_count: int) -> int:
         """计算冷却时间（指数退避）"""
@@ -694,15 +831,21 @@ def main():
     # 解析命令行
     args = sys.argv[1:]
     max_count = None
+    night_mode = True  # 默认夜间模式
     i = 0
     while i < len(args):
         if args[i] == "--count" and i+1 < len(args):
             max_count = int(args[i+1])
             i += 2
+        elif args[i] == "--day-mode":
+            night_mode = False
+            Config.NIGHT_MODE = False
+            i += 1
         elif args[i] == "--help" or args[i] == "-h":
             print(__doc__)
             print("用法:")
-            print("  python bili2doc.py              # 处理全部待处理视频")
+            print("  python bili2doc.py              # 夜间模式运行（默认）")
+            print("  python bili2doc.py --day-mode   # 白天模式运行")
             print("  python bili2doc.py --count 5    # 只处理5个（测试用）")
             return
         else:
