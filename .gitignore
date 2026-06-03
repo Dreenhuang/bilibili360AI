@@ -1,0 +1,57 @@
+# Git 忽略规则
+# bili2doc 项目
+
+# 环境变量和密钥
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.cert
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# 项目特定
+logs/
+垃圾箱/
+batch_state.json
+video_list.json
+
+# 调试截图（保留生产版本截图）
+screenshots/v[0-3]*.png
+screenshots/v[0-4]*.png
+fullscreens/
+html_dumps/
+reports/
+coordinates/
+
+# 旧版本脚本（保留生产版）
+scripts/[0-5]*.py
+scripts/[6-9][0-9]*.py
